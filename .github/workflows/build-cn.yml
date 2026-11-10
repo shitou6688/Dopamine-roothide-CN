@@ -44,13 +44,16 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # Dopamine-roothide 3.x does not build with Xcode 26 / iPhoneOS26 SDK:
+    # Apple clang 21's linker segfaults on watchdoghook.dylib. macos-15 ships
+    # Xcode 16.4 (default), which is the toolchain this branch targets.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - name: Xcode setup
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: '16.4'
 
       - name: Checkout this repository
         uses: actions/checkout@v4
