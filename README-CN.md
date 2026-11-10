@@ -4,6 +4,8 @@
 
 不用给设备挂代理。构建机（GitHub Actions 的 macOS runner）替你完成所有境外网络请求，把结果塞进 IPA；设备端要么完全不联网，要么只连 Apple 在国内有缓存节点的 CDN。
 
+> 本仓库：`https://github.com/shitou6688/Dopamine-roothide-CN`。工作流已在 Actions 全量跑通（macos-15 / Xcode 16.4），首次成功产物为 3.0.13-30，见 Actions → `Build Dopamine-roothide CN` 的 Artifacts。
+
 ## 为什么原来必须挂代理
 
 `Application/Dopamine/Jailbreak/DOEnvironmentManager.m` 的 `-accessibleKernelPath` 在**非 TrollStore 安装的普通签名 IPA** 里读不到系统 kernelcache，于是调用 `grab_images()`（闭源的 `libgrabkernel2.a`）。从该静态库里可读出它第一步请求：
@@ -40,7 +42,7 @@ Relaxin 并不是"换了个国内下载源"。它把 kernelcache 里能静态确
 
 ## 三步使用
 
-1. **建仓库**（二选一，不用 Mac）
+1. **建仓库**（二选一，不用 Mac；本仓库已经建好，直接用可跳过此步）
    - A：新建一个空仓库，把本目录的 `.github/` 和 `Tools/` 原样放进去。工作流会自动克隆 `roothide/Dopamine-roothide` 的 `3.x` 分支再打补丁。仓库小、最省事。
    - B：Fork `roothide/Dopamine-roothide`，把 `.github/workflows/build-cn.yml` 和 `Tools/` 加到 3.x 分支。工作流直接用 fork 源码。
 
@@ -81,9 +83,11 @@ Relaxin 并不是"换了个国内下载源"。它把 kernelcache 里能静态确
 
 ## 已验证 / 未执行
 
-已验证：远程 ZIP64 目录解析（合成包自测）、Apple CDN 的 206 Range、真实 11.5 GB 与 7.9 GB 两份 IPSW 的 kernelcache / sptm / txm 定位与 SHA-256、`KernelIndex.plist` 生成、补丁在真实 3.x 源码上的精确 diff 与幂等性、工作流 YAML 结构。
+已验证：远程 ZIP64 目录解析（合成包自测）、Apple CDN 的 206 Range、真实 11.5 GB 与 7.9 GB 两份 IPSW 的 kernelcache / sptm / txm 定位与 SHA-256、`KernelIndex.plist` 生成、补丁在真实 3.x 源码上的精确 diff 与幂等性、**GitHub Actions 全量编译 + 重打包 + 产物上传**（run `42813628737`，15 个步骤全绿，产出 4 个 IPA/TIPA，共 244 MB、内含 `KernelIndex.plist` 与离线三件套）。
 
-未执行：**GitHub Actions 全量编译和真机越狱验证**（当前环境是 Windows，没有 macOS/Xcode）。你跑一次工作流即可验证；若 `gmake` 阶段报错，优先看 Xcode 版本与 `iPhoneOS16.5.sdk` 下载那一步，与上游官方 `main.yml` 行为一致。
+未执行：**真机越狱验证**（需要你自己的设备）。索引与离线内核按 `Tools/targets.txt` 生成，当前默认是示例 `iPhone15,3|21D61`，换成自己机型与 Build 后重跑即可。
+
+工具链注意：runner 固定 `macos-15`、Xcode `16.4`。Xcode 26.6 / iPhoneOS26.5 SDK 下 Apple clang 21 的链接器会在 `watchdoghook.dylib` 段错误，`install_name_tool -delete_rpath` 也会报错；不要改成 `macos-latest`。另：`Install THEOS` 步骤不能提前创建非空的 `$THEOS`（安装脚本会误判为已安装并调用不存在的 `bin/update-theos`），SDK 用 `xz -dk` 显式解压。
 
 其它限制：
 - 索引按 build 固化，新系统版本发布后需重跑工作流刷新；未命中会静默回落到原下载路径（功能正常，只是仍需要代理）。
