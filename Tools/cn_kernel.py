@@ -733,13 +733,13 @@ NEW_BLOCK = '''        NSString *documentsDir = [NSHomeDirectory() stringByAppen
         NSString *kernelcachePath = [documentsDir stringByAppendingPathComponent:@"kernelcache"];
         if ([[NSFileManager defaultManager] fileExistsAtPath:kernelcachePath]) return kernelcachePath;
 
-        // CN path: metadata was resolved at build time; only Apple CDN Range
-        // requests are needed. Falls back to libgrabkernel2 on any miss.
-        [[DOUIManager sharedInstance] sendLog:@"Downloading Kernel (CN direct)" debug:NO];
+        // L1: metadata was resolved at build time; only Apple CDN Range
+        // requests are needed. L2 = hardened grab_images() runtime resolve.
+        [[DOUIManager sharedInstance] sendLog:@"Downloading Kernel (CN hybrid L1)" debug:NO];
         if (DOCNTryIndexDownload(documentsDir)) {
             if ([[NSFileManager defaultManager] fileExistsAtPath:kernelcachePath]) return kernelcachePath;
         }
-        [[DOUIManager sharedInstance] sendLog:@"Falling back to libgrabkernel2" debug:NO];
+        [[DOUIManager sharedInstance] sendLog:@"Falling back to hardened runtime resolve (L2)" debug:NO];
         if (grab_images(documentsDir) == false) return nil;
         return kernelcachePath;'''
 
@@ -756,6 +756,12 @@ def cmd_patch(args) -> None:
     with open(target, "r", encoding="utf-8", newline="") as f:
         src = f.read()
 
+    newline = "\r\n" if "\r\n" in src else "\n"
+
+    def adapt(text):
+        """Match the checkout's line endings (CI uses LF, Windows may use CRLF)."""
+        return text.replace("\r\n", "\n").replace("\n", newline)
+
     if PATCH_BEGIN in src:
         log("DOEnvironmentManager.m already patched (idempotent)")
     else:
@@ -763,20 +769,20 @@ def cmd_patch(args) -> None:
         anchor = "#import <libgrabkernel2/libgrabkernel2.h>"
         if anchor not in src:
             die(f"cannot find import anchor: {anchor}")
-        src = src.replace(anchor, anchor + "\n" + IMPORT_LINE, 1)
+        src = src.replace(anchor, anchor + newline + IMPORT_LINE, 1)
         # 2) replace the download block
-        if OLD_BLOCK not in src:
+        if adapt(OLD_BLOCK) not in src:
             die("download block does not match upstream 3.x; inspect "
                 "-accessibleKernelPath in DOEnvironmentManager.m manually")
-        src = src.replace(OLD_BLOCK,
-                          PATCH_BEGIN + "\n" + NEW_BLOCK + "\n" + PATCH_END, 1)
+        src = src.replace(adapt(OLD_BLOCK),
+                          adapt(PATCH_BEGIN + "\n" + NEW_BLOCK + "\n" + PATCH_END), 1)
         # 3) let the app bundle carry IM4P payloads under their native name,
         #    exactly like grab_images() writes them into Documents.
         for label, old, new in (("accessibleSPTMPath", SPTM_OLD, SPTM_NEW),
                                 ("accessibleTXMPath", TXM_OLD, TXM_NEW)):
-            if old not in src:
+            if adapt(old) not in src:
                 die(f"{label} block does not match upstream 3.x; inspect it manually")
-            src = src.replace(old, new, 1)
+            src = src.replace(adapt(old), adapt(new), 1)
         with open(target, "w", encoding="utf-8", newline="") as f:
             f.write(src)
         log("patched DOEnvironmentManager.m (import + 3 accessible*Path methods)")

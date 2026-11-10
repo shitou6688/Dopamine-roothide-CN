@@ -1,29 +1,42 @@
 //
 //  DO_CN_KernelSource.h
-//  Dopamine-roothide CN kernel source
+//  Dopamine CN hybrid kernel source
 //
 //  Fully inline implementation: this header is #import'ed by
 //  DOEnvironmentManager.m only. No new compile source, no new linked
 //  framework and no .xcodeproj / pbxproj edit is required.
 //
-//  Runtime data flow
-//  -----------------
-//  Upstream libgrabkernel2 first downloads a ~72 MB metadata blob from
-//  api.appledb.dev, which is unreliable on mainland China networks. This
-//  helper never contacts that host. All metadata was resolved on the GitHub
-//  Actions runner and shipped as KernelIndex.plist in the app bundle. At
-//  runtime it only issues HTTP Range requests against updates.cdn-apple.com
-//  (or a user supplied mirror), verifies the digest (SHA-256 for schema 1,
-//  ZIP CRC32 for the full-coverage schema 2) and atomically writes
-//  Documents/kernelcache, Documents/sptm.im4p and Documents/txm.im4p, which
-//  are exactly the paths -accessibleSPTMPath / -accessibleTXMPath look up.
+//  Hybrid kernel acquisition (three layers)
+//  ---------------------------------------
+//  L1  Build-time index (main path, mainland-China friendly).
+//      All AppleDB metadata and every IPSW central directory were resolved on
+//      the GitHub Actions runner and shipped as KernelIndex.plist in the app
+//      bundle. This file never contacts api.appledb.dev. For a hit it issues
+//      one HTTP Range request per image against updates.cdn-apple.com (or a
+//      user supplied mirror), inflates raw deflate, verifies CRC32 / SHA-256
+//      and atomically writes Documents/kernelcache, Documents/sptm.im4p and
+//      Documents/txm.im4p - exactly the paths -accessibleSPTMPath /
+//      -accessibleTXMPath look up.
+//
+//  L2  Hardened runtime resolve (index miss / new firmware).
+//      Tools/apply_hardening.py replaces the upstream libgrabkernel2.a and
+//      libpartial.a with hardened builds. grab_images() then walks every
+//      AppleDB firmware candidate, retries each three times, verifies the
+//      BuildManifest digest and stages all three images. This keeps the
+//      "no prebuilt index needed" property. It may contact api.appledb.dev,
+//      so it is only a fallback - L1 is what makes a normal signature work
+//      without a proxy.
+//
+//  L3  Upstream failure path. No multi-GB IPSW download is attempted.
+//
+//  Request hardening (shared by L1 and derived from L2's partial-zip work):
+//  Accept-Encoding: identity, Safari UA, If-Range/ETag, 200-response slicing
+//  with a hard size cap, explicit short-read rejection, 120 s / 900 s
+//  timeouts and three attempts per candidate.
 //
 //  Schema 2 indexes one entry per <hw.machine>|<kern.osversion> for every
 //  iPhone/iPad/iPod and every firmware Dopamine supports, so any supported
 //  device installed with a normal (non-TrollStore) signature is covered.
-//
-//  If anything misses or fails, it returns NO and the original
-//  grab_images() path remains the fallback.
 //
 
 #ifndef DO_CN_KernelSource_h
@@ -35,15 +48,20 @@
 #import <string.h>
 #import <sys/sysctl.h>
 #import <unistd.h>
-// Dopamine-roothide already links libz.tbd / libcompression.tbd, so raw
-// inflate needs no project file change.
+// Dopamine already links libz.tbd / libcompression.tbd, so raw inflate needs
+// no project file change (BaseBin/dopamine/Makefile additionally gets -lz).
 #import <zlib.h>
 
 // schema 1 = single-target index with SHA-256 digests (offline/exact builds)
 // schema 2 = full-coverage index with ZIP CRC32 digests (no payload download
 //            at build time, thousands of <device>|<build> entries)
 #define DOCN_INDEX_SCHEMA 2
-#define DOCN_HTTP_TIMEOUT 90.0
+#define DOCN_HTTP_TIMEOUT 120.0
+#define DOCN_HTTP_RESOURCE_TIMEOUT 900.0
+#define DOCN_MAX_ATTEMPTS 3
+// A CDN that ignores Range may stream the whole IPSW. Never buffer more than
+// this in memory; slice small accidental 200 responses instead.
+#define DOCN_MAX_ACCIDENTAL_FULL_RESPONSE (128ULL * 1024 * 1024)
 
 static NSString *DOCNStringForSysctl(const char *name) {
     size_t size = 0;
@@ -114,46 +132,87 @@ static BOOL DOCNVerifyImage(NSData *data, NSDictionary *info) {
     return YES;  // legacy entry with no digest
 }
 
-// Synchronous NSURLSession data task. The completion handler always runs on
-// the session's own delegate queue, so waiting on a semaphore here is safe.
+// ETag of the first response per URL; If-Range keeps subsequent Range requests
+// pinned to the same IPSW representation so a CDN edge cannot mix versions.
+static NSMutableDictionary<NSString *, NSString *> *DOCNETagCache(void) {
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [NSMutableDictionary dictionary];
+    });
+    return cache;
+}
+
+// Synchronous NSURLSession data task. The completion handler runs on the
+// session's own delegate queue, so waiting on a semaphore here is safe.
 static NSData *DOCNHTTPFetch(NSURL *url, uint64_t start, uint64_t length, NSTimeInterval timeout) {
     if (!url) return nil;
+    NSString *cacheKey = url.absoluteString;
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url
                                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                       timeoutInterval:timeout];
+    // gzip/zstd transport encoding would shift every byte offset we computed
+    // from the ZIP central directory. Force identity on every hop.
+    [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
+    [request setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_16 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1 DopamineCNKernel/2.0" forHTTPHeaderField:@"User-Agent"];
+    [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+    [request setValue:@"zh-CN,zh;q=0.9,en;q=0.8" forHTTPHeaderField:@"Accept-Language"];
+    [request setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
     if (length > 0) {
         [request setValue:[NSString stringWithFormat:@"bytes=%llu-%llu", start, start + length - 1]
        forHTTPHeaderField:@"Range"];
+        NSString *knownETag = nil;
+        @synchronized (DOCNETagCache()) {
+            knownETag = DOCNETagCache()[cacheKey];
+        }
+        if (knownETag.length) {
+            [request setValue:knownETag forHTTPHeaderField:@"If-Range"];
+        }
     }
-    [request setValue:@"DopamineCNKernel/1.0" forHTTPHeaderField:@"User-Agent"];
 
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block NSData *payload = nil;
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     configuration.timeoutIntervalForRequest = timeout;
-    configuration.timeoutIntervalForResource = timeout * 3;
+    configuration.timeoutIntervalForResource = DOCN_HTTP_RESOURCE_TIMEOUT;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
     NSURLSessionDataTask *task = [session dataTaskWithRequest:request
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            NSInteger status = [response isKindOfClass:NSHTTPURLResponse.class]
-                ? [(NSHTTPURLResponse *)response statusCode] : 0;
-            if (!error && length == 0 && status == 200 && data.length > 0) {
+            NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class]
+                ? (NSHTTPURLResponse *)response : nil;
+            NSInteger status = http ? http.statusCode : 0;
+            NSString *etag = [http valueForHTTPHeaderField:@"ETag"] ?: http.allHeaderFields[@"ETag"];
+            if (etag.length) {
+                @synchronized (DOCNETagCache()) {
+                    DOCNETagCache()[cacheKey] = etag;
+                }
+            }
+            if (!error && length == 0 && (status == 200 || status == 206) && data.length > 0) {
                 // Whole-file mirror download.
                 payload = data;
             }
             else if (!error && length > 0 && status == 206 && data.length == length) {
-                // A 200 here would mean the server ignored Range and streamed
-                // the entire multi-GB IPSW; reject it instead of slicing.
+                // Exact partial content.
                 payload = data;
             }
+            else if (!error && length > 0 && status == 200 &&
+                     data.length >= start + length &&
+                     data.length <= DOCN_MAX_ACCIDENTAL_FULL_RESPONSE) {
+                // Some caching layers ignore Range and return the whole object.
+                // Slice back to our window, but refuse multi-GB responses.
+                payload = [data subdataWithRange:NSMakeRange((NSUInteger)start, (NSUInteger)length)];
+                NSLog(@"[CNKernel] server ignored Range, sliced %llu bytes from 200 response", length);
+            }
             else {
-                NSLog(@"[CNKernel] request failed status=%ld error=%@", (long)status, error.localizedDescription);
+                NSLog(@"[CNKernel] request failed status=%ld bytes=%lu wanted=%llu error=%@",
+                      (long)status, (unsigned long)data.length, length,
+                      error.localizedDescription);
             }
             dispatch_semaphore_signal(semaphore);
         }];
     [task resume];
     dispatch_semaphore_wait(semaphore,
-                            dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 5) * NSEC_PER_SEC)));
+                            dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 10) * NSEC_PER_SEC)));
     [session invalidateAndCancel];
     return payload;
 }
@@ -191,7 +250,8 @@ static BOOL DOCNWriteAtomically(NSData *data, NSString *destination) {
     return YES;
 }
 
-// Download one logical image. Returns nil on failure.
+// Download one logical image. Every candidate is attempted up to
+// DOCN_MAX_ATTEMPTS times; short reads and checksum mismatches are retried.
 static NSData *DOCNFetchImage(NSDictionary *index, NSDictionary *entry,
                               NSString *slot, NSArray<NSString *> *firmwareURLs) {
     NSDictionary *info = entry[slot];
@@ -203,13 +263,20 @@ static NSData *DOCNFetchImage(NSDictionary *index, NSDictionary *entry,
     NSDictionary *direct = entry[@"directURLs"] ?: index[@"directURLs"];
     NSArray *directURLs = [direct[slot] isKindOfClass:NSArray.class] ? direct[slot] : nil;
     for (NSString *candidate in directURLs) {
-        NSData *data = DOCNHTTPFetch([NSURL URLWithString:candidate], 0, 0, DOCN_HTTP_TIMEOUT);
-        if (!data.length) continue;
-        if (!DOCNVerifyImage(data, info)) {
-            NSLog(@"[CNKernel] %@ direct mirror checksum mismatch", slot);
-            continue;
+        NSURL *url = [NSURL URLWithString:candidate];
+        for (int attempt = 0; attempt < DOCN_MAX_ATTEMPTS; attempt++) {
+            if (attempt) {
+                NSLog(@"[CNKernel] Retrying mirror download (attempt %d/%d)",
+                      attempt + 1, DOCN_MAX_ATTEMPTS);
+                sleep(1);
+            }
+            NSData *data = DOCNHTTPFetch(url, 0, 0, DOCN_HTTP_TIMEOUT);
+            if (!data.length || !DOCNVerifyImage(data, info)) {
+                NSLog(@"[CNKernel] %@ direct mirror empty or checksum mismatch", slot);
+                continue;
+            }
+            return data;
         }
-        return data;
     }
 
     NSInteger method = compression.integerValue;
@@ -227,21 +294,32 @@ static NSData *DOCNFetchImage(NSDictionary *index, NSDictionary *entry,
     uint64_t count = length.unsignedLongLongValue;
 
     for (NSString *candidate in firmwareURLs) {
-        NSData *data = DOCNHTTPFetch([NSURL URLWithString:candidate], start, count,
-                                    DOCN_HTTP_TIMEOUT);
-        if (data.length != count) continue;
-        if (method == 8) {
-            NSNumber *rawSize = info[@"size"] ?: info[@"uncompressedSize"];
-            data = DOCNInflateRaw(data, rawSize.unsignedLongLongValue);
-            if (!data) continue;
+        NSURL *url = [NSURL URLWithString:candidate];
+        for (int attempt = 0; attempt < DOCN_MAX_ATTEMPTS; attempt++) {
+            if (attempt) {
+                NSLog(@"[CNKernel] Retrying range download (attempt %d/%d)",
+                      attempt + 1, DOCN_MAX_ATTEMPTS);
+                sleep(1);
+            }
+            NSData *data = DOCNHTTPFetch(url, start, count, DOCN_HTTP_TIMEOUT);
+            if (data.length != count) {
+                NSLog(@"[CNKernel] %@ short read (%lu/%llu bytes)", slot,
+                      (unsigned long)data.length, count);
+                continue;
+            }
+            if (method == 8) {
+                NSNumber *rawSize = info[@"size"] ?: info[@"uncompressedSize"];
+                data = DOCNInflateRaw(data, rawSize.unsignedLongLongValue);
+                if (!data) continue;
+            }
+            if (!DOCNVerifyImage(data, info)) {
+                NSLog(@"[CNKernel] %@ checksum mismatch from %@", slot, candidate);
+                continue;
+            }
+            NSLog(@"[CNKernel] %@ ready (%lu bytes) from %@", slot,
+                  (unsigned long)data.length, url.host);
+            return data;
         }
-        if (!DOCNVerifyImage(data, info)) {
-            NSLog(@"[CNKernel] %@ checksum mismatch from %@", slot, candidate);
-            continue;
-        }
-        NSLog(@"[CNKernel] %@ ready (%lu bytes) from %@", slot,
-              (unsigned long)data.length, [NSURL URLWithString:candidate].host);
-        return data;
     }
     return nil;
 }
@@ -256,12 +334,12 @@ static BOOL DOCNTryIndexDownload(NSString *documentsDir) {
     NSString *key = [NSString stringWithFormat:@"%@|%@", device, build];
     NSDictionary *entry = index[@"entries"][key];
     if (![entry isKindOfClass:NSDictionary.class]) {
-        NSLog(@"[CNKernel] no index entry for %@; falling back", key);
+        NSLog(@"[CNKernel] no index entry for %@; falling back to L2", key);
         return NO;
     }
     NSArray<NSString *> *firmwareURLs = entry[@"firmwareURLs"];
     if (![firmwareURLs isKindOfClass:NSArray.class] || firmwareURLs.count == 0) return NO;
-    NSLog(@"[CNKernel] index hit %@ (%lu mirror(s))", key, (unsigned long)firmwareURLs.count);
+    NSLog(@"[CNKernel] L1 index hit %@ (%lu mirror(s))", key, (unsigned long)firmwareURLs.count);
 
     NSDictionary<NSString *, NSString *> *destinations = @{
         @"kernel" : @"kernelcache",
@@ -275,7 +353,7 @@ static BOOL DOCNTryIndexDownload(NSString *documentsDir) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:destination]) continue;
         NSData *data = DOCNFetchImage(index, entry, slot, firmwareURLs);
         if (!data || !DOCNWriteAtomically(data, destination)) {
-            NSLog(@"[CNKernel] failed to materialize %@", slot);
+            NSLog(@"[CNKernel] failed to materialize %@; falling back to L2", slot);
             ok = NO;
             break;
         }

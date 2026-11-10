@@ -1,5 +1,29 @@
 # Dopamine-roothide 国内网络内核源 + GitHub Actions 打包
 
+## 合并版（hybrid）：L1 构建期索引 + L2 加固运行时解析
+
+2026-11-11 起本仓库把两套方案的优点合在一起：
+
+| 能力 | 来源 | 作用 |
+| --- | --- | --- |
+| 构建期 `KernelIndex.plist`（全量约 5468 条） | 本仓库 CN 版 | 命中即只访问 Apple CDN，国内普通签名免代理 |
+| 加固版 `libgrabkernel2.a` / `libpartial.a` | 朋友修复版 | 索引未命中时运行时动态解析，新固件无需重打包也能尝试 |
+| `Accept-Encoding: identity`、Safari UA、`If-Range`/ETag、200 响应裁剪、短读拒绝、每候选重试 3 次 | 朋友版（L2）+ 已同步进 L1 | 弱网与 CDN 边缘更稳 |
+| `BuildManifest` SHA 摘要 / ZIP CRC32 / SHA-256 | 两边 | 损坏数据不落盘 |
+| `boot_manifest_hash()`、`activePrebootPath` 等空指针防护 | 朋友版 | 消除越狱前取不到 preboot 哈希时的崩溃 |
+
+**三层链路**
+
+- **L1**（主路，日志 `Downloading Kernel (CN hybrid L1)`）：查内置索引 → 每个文件 1 次 Range 请求 → raw inflate → CRC32 校验 → 写 `Documents/`。**不访问 `api.appledb.dev`**。
+- **L2**（日志 `Falling back to hardened runtime resolve (L2)`）：索引未命中 → 加固 `grab_images()` 遍历 AppleDB 全部候选（https/http、ipsw/ota）、每个重试 3 次、按 BuildManifest Digest 校验、补齐 `kernelcache` / `sptm.im4p` / `txm.im4p`。**此层可能访问境外接口**，仅作兜底。
+- **L3**：上游失败路径，不下载数 GB 整包 IPSW。
+
+新增文件：`Tools/apply_hardening.py`、`Tools/hardened/*.a`（fat arm64 + arm64e，替换上游同名库）、`Tools/hardened/src/`（对应可复现源码）。工作流在 `Apply CN kernel-source patch` 之后自动执行 `apply_hardening.py`，所有替换幂等。
+
+抓日志：`idevicesyslog -u <UDID> | grep -E "CNKernel|Downloading Kernel|hardened|Trying firmware|Retrying|Downloaded"`。
+
+> L2 的价值是覆盖索引未收录的新固件，不是让国内免代理；免代理靠 L1。真机越狱验证未执行。
+
 ## 结论先说
 
 不用给设备挂代理。构建机（GitHub Actions 的 macOS runner）替你完成所有境外网络请求，把结果塞进 IPA；设备端要么完全不联网，要么只连 Apple 在国内有缓存节点的 CDN。
@@ -10,7 +34,7 @@
 
 单设备索引每条都要下载 17 MB kernelcache 算 SHA-256，几千条会跑爆 CI。全量索引改用 **ZIP 中央目录**里的信息：文件名、压缩方式、offset、length、原始大小、以及**未压缩数据的 CRC32**。构建机对每个 IPSW 只读尾部 64 KB、中央目录、几十字节的 local header 和 BuildManifest.plist，并发探测即可；设备端 inflate 后用 CRC32 验真（zlib 已链接）。真实固件实测：18,620,103 字节内核，计算 CRC32 `0x98e5063d` 与索引一致。
 
-设备清单来自 `api.ipsw.me/v4/devices`，按 `-versionSupportString` 的范围过滤（iOS/iPadOS 15.0–18.7.1，A12/A13 PPL 分支另含 26.0–26.0.1），逐设备取其所有仍可访问的 IPSW 直链。索引键仍是 `<hw.machine>|<kern.osversion>`，命中就完全不碰 `appledb.dev`；查不到才回落 `grab_images()`。
+设备清单来自 `api.ipsw.me/v4/devices`，按 `-versionSupportString` 的范围过滤（iOS/iPadOS 15.0–18.7.1，A12/A13 PPL 分支另含 26.0–26.0.1），逐设备取其所有仍可访问的 IPSW 直链。索引键仍是 `<hw.machine>|<kern.osversion>`，命中就完全不碰 `appledb.dev`；查不到才回落到加固版 `grab_images()`（见合并版章节 L2）。
 
 `coverage=single` 则退回旧的按 `targets.txt` 生成单设备索引（schema 1，带 SHA-256），也可同时产出该设备的完全离线包。
 
