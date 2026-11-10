@@ -13,9 +13,14 @@
 //  helper never contacts that host. All metadata was resolved on the GitHub
 //  Actions runner and shipped as KernelIndex.plist in the app bundle. At
 //  runtime it only issues HTTP Range requests against updates.cdn-apple.com
-//  (or a user supplied mirror), verifies SHA-256 and atomically writes
+//  (or a user supplied mirror), verifies the digest (SHA-256 for schema 1,
+//  ZIP CRC32 for the full-coverage schema 2) and atomically writes
 //  Documents/kernelcache, Documents/sptm.im4p and Documents/txm.im4p, which
 //  are exactly the paths -accessibleSPTMPath / -accessibleTXMPath look up.
+//
+//  Schema 2 indexes one entry per <hw.machine>|<kern.osversion> for every
+//  iPhone/iPad/iPod and every firmware Dopamine supports, so any supported
+//  device installed with a normal (non-TrollStore) signature is covered.
 //
 //  If anything misses or fails, it returns NO and the original
 //  grab_images() path remains the fallback.
@@ -34,7 +39,10 @@
 // inflate needs no project file change.
 #import <zlib.h>
 
-#define DOCN_INDEX_SCHEMA 1
+// schema 1 = single-target index with SHA-256 digests (offline/exact builds)
+// schema 2 = full-coverage index with ZIP CRC32 digests (no payload download
+//            at build time, thousands of <device>|<build> entries)
+#define DOCN_INDEX_SCHEMA 2
 #define DOCN_HTTP_TIMEOUT 90.0
 
 static NSString *DOCNStringForSysctl(const char *name) {
@@ -65,7 +73,8 @@ static NSDictionary *DOCNLoadIndex(NSString *documentsDir) {
     }
     if (![index isKindOfClass:NSDictionary.class]) return nil;
     NSNumber *schema = index[@"schema"];
-    if (![schema isKindOfClass:NSNumber.class] || schema.integerValue != DOCN_INDEX_SCHEMA) {
+    if (![schema isKindOfClass:NSNumber.class] ||
+        (schema.integerValue != 1 && schema.integerValue != DOCN_INDEX_SCHEMA)) {
         NSLog(@"[CNKernel] index schema rejected: %@", schema);
         return nil;
     }
@@ -81,6 +90,28 @@ static NSString *DOCNSHA256(NSData *data) {
         [out appendFormat:@"%02x", digest[i]];
     }
     return out;
+}
+
+// A full-coverage index cannot carry SHA-256: computing it would mean
+// downloading every 17 MB kernelcache at build time. ZIP central directories
+// already hold the CRC32 of the *uncompressed* member, which is exactly what
+// the device has after inflating. libz is already linked by the project.
+static uint32_t DOCNCRC32(NSData *data) {
+    uLong crc = crc32(0L, Z_NULL, 0);
+    return (uint32_t)crc32(crc, data.bytes, (uInt)data.length);
+}
+
+static BOOL DOCNVerifyImage(NSData *data, NSDictionary *info) {
+    if (!data.length) return NO;
+    NSString *hash = info[@"sha256"];                 // schema 1
+    if ([hash isKindOfClass:NSString.class] && hash.length) {
+        return [DOCNSHA256(data) isEqualToString:hash];
+    }
+    NSNumber *crc = info[@"crc32"];                    // schema 2
+    if ([crc isKindOfClass:NSNumber.class]) {
+        return DOCNCRC32(data) == (uint32_t)crc.unsignedIntValue;
+    }
+    return YES;  // legacy entry with no digest
 }
 
 // Synchronous NSURLSession data task. The completion handler always runs on
@@ -165,7 +196,6 @@ static NSData *DOCNFetchImage(NSDictionary *index, NSDictionary *entry,
                               NSString *slot, NSArray<NSString *> *firmwareURLs) {
     NSDictionary *info = entry[slot];
     if (![info isKindOfClass:NSDictionary.class]) return nil;
-    NSString *expectedHash = info[@"sha256"];
     NSNumber *compression = info[@"compression"];
 
     // Whole-file mirrors take priority: they work even for deflated ZIP
@@ -175,8 +205,8 @@ static NSData *DOCNFetchImage(NSDictionary *index, NSDictionary *entry,
     for (NSString *candidate in directURLs) {
         NSData *data = DOCNHTTPFetch([NSURL URLWithString:candidate], 0, 0, DOCN_HTTP_TIMEOUT);
         if (!data.length) continue;
-        if (expectedHash.length && ![DOCNSHA256(data) isEqualToString:expectedHash]) {
-            NSLog(@"[CNKernel] %@ direct mirror hash mismatch", slot);
+        if (!DOCNVerifyImage(data, info)) {
+            NSLog(@"[CNKernel] %@ direct mirror checksum mismatch", slot);
             continue;
         }
         return data;
@@ -205,8 +235,8 @@ static NSData *DOCNFetchImage(NSDictionary *index, NSDictionary *entry,
             data = DOCNInflateRaw(data, rawSize.unsignedLongLongValue);
             if (!data) continue;
         }
-        if (expectedHash.length && ![DOCNSHA256(data) isEqualToString:expectedHash]) {
-            NSLog(@"[CNKernel] %@ hash mismatch from %@", slot, candidate);
+        if (!DOCNVerifyImage(data, info)) {
+            NSLog(@"[CNKernel] %@ checksum mismatch from %@", slot, candidate);
             continue;
         }
         NSLog(@"[CNKernel] %@ ready (%lu bytes) from %@", slot,

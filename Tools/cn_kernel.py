@@ -28,8 +28,12 @@ Commands
 --------
   selftest              Verify the remote-zip reader against a synthetic ZIP64 file.
   probe   --url URL     Inspect a real IPSW (uses only a few KB of traffic).
-  index   --out FILE    Build KernelIndex.plist from --targets / --device+--build
-                        / --firmware-url.
+  index   --out FILE    Build a schema-1 KernelIndex.plist (single target,
+                        includes SHA-256 of each downloaded kernel image).
+  fullindex --out FILE  Build a schema-2 index covering every iPhone/iPad/iPod
+                        and every firmware version Dopamine supports. Reads
+                        only ZIP central directories (CRC32 instead of SHA-256),
+                        concurrently, so thousands of IPSWs stay cheap.
   fetch   --out DIR     Download kernelcache + sptm + txm for one target
                         (fully-offline IPA mode).
   patch   --repo DIR    Idempotently patch DOEnvironmentManager.m and copy the
@@ -86,10 +90,12 @@ def die(msg: str) -> None:
 
 
 class RemoteZip:
-    def __init__(self, url: str, timeout: int = 60, retries: int = 3):
+    def __init__(self, url: str, timeout: int = 60, retries: int = 3,
+                 quiet: bool = False):
         self.url = url
         self.timeout = timeout
         self.retries = retries
+        self.quiet = quiet
         self.size = self._probe_size()
         self._entries: dict[str, dict] | None = None
 
@@ -181,7 +187,8 @@ class RemoteZip:
         if self._entries is not None:
             return self._entries
         total, cd_size, cd_offset = self._eocd()
-        log(f"central directory: {total} entries, {cd_size} bytes @ {cd_offset}")
+        if not self.quiet:
+            log(f"central directory: {total} entries, {cd_size} bytes @ {cd_offset}")
         cd = self.fetch(cd_offset, cd_size)
         result: dict[str, dict] = {}
         p = 0
@@ -237,6 +244,10 @@ class RemoteZip:
             "length": e["compressed_size"],
             "compression": e["compression"],
             "uncompressedSize": e["uncompressed_size"],
+            # ZIP central directory CRC of the *uncompressed* member. It lets
+            # the device verify an inflated kernel without the build machine
+            # ever downloading the 17 MB payload.
+            "crc32": e["crc"],
         }
 
 
@@ -453,6 +464,158 @@ def _entry_for(urls: list[str], device: str, build: str) -> dict:
         log(f"{device}|{build} {slot}: {info['path']} "
             f"len={info['length']} raw={info['size']} sha256={info['sha256'][:16]}...")
     return entry
+
+
+# ---------------------------------------------------------------------------
+# Full-coverage index (schema 2)
+#
+# A single-target index can afford to download each 17 MB kernelcache and
+# store its SHA-256. Covering every jailbreakable device cannot: thousands of
+# IPSWs would mean tens of gigabytes. ZIP central directories already carry
+# CRC32, method, sizes and offsets, so `fullindex` only reads the tail, the
+# central directory, the tiny local headers and BuildManifest.plist. The
+# device verifies the inflated payload against that CRC32 instead.
+# ---------------------------------------------------------------------------
+
+IPSW_DEVICES_API = "https://api.ipsw.me/v4/devices"
+
+
+def _version_tuple(v: str) -> tuple[int, int, int]:
+    nums = [int(x) for x in re.findall(r"\d+", v)[:3]]
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])  # type: ignore[return-value]
+
+
+def _in_support_range(version: str) -> bool:
+    """Mirror -versionSupportString in DOEnvironmentManager.m."""
+    v = _version_tuple(version)
+    if (15, 0, 0) <= v <= (18, 7, 1):
+        return True
+    if (26, 0, 0) <= v <= (26, 0, 1):  # A12/A13 PPL branch
+        return True
+    return False
+
+
+def _catalog_devices(explicit_file: str | None) -> list[str]:
+    if explicit_file:
+        with open(explicit_file, encoding="utf-8") as f:
+            return sorted({line.strip() for line in f
+                           if line.strip() and not line.lstrip().startswith("#")})
+    j = _get_json(IPSW_DEVICES_API, timeout=60)
+    ids = [d["identifier"] for d in j if isinstance(d, dict)
+           and str(d.get("identifier", "")).startswith(("iPhone", "iPad", "iPod"))]
+    return sorted(set(ids))
+
+
+def _device_targets(device: str) -> list[tuple[str, str, str, str]]:
+    """(device, build, marketing version, IPSW URL) for supported firmware."""
+    j = None
+    for attempt in range(3):
+        try:
+            j = _get_json(IPSW_API.format(device=device), timeout=45)
+            break
+        except Exception as exc:
+            if attempt == 2:
+                log(f"catalog {device}: {type(exc).__name__}")
+                return []
+            time.sleep(1 + attempt)
+    if j is None:
+        return []
+    out: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+    for fw in j.get("firmwares", []):
+        version = str(fw.get("version", ""))
+        build = str(fw.get("buildid", ""))
+        url = str(fw.get("url", ""))
+        if not build or build in seen or not url.startswith("https://"):
+            continue
+        if not _in_support_range(version):
+            continue
+        seen.add(build)
+        out.append((device, build, version, url))
+    return out
+
+
+def _entry_for_fast(urls: list[str], device: str, build: str,
+                    timeout: int = 25) -> dict:
+    rz = RemoteZip(urls[0], timeout=timeout, retries=2, quiet=True)
+    names = pick_kernel_names(rz)
+    entry: dict = {"firmwareURLs": urls, "ipswSize": rz.size}
+    for slot in ("kernel", "sptm", "txm"):
+        if slot in names:
+            entry[slot] = rz.range_of(names[slot])
+    if "kernel" not in entry:
+        raise RuntimeError("kernelcache member missing")
+    return entry
+
+
+def cmd_fullindex(args) -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    devices = _catalog_devices(args.devices)
+    if args.device_limit:
+        devices = devices[:args.device_limit]
+    log(f"catalog: {len(devices)} iOS/iPadOS device identifiers")
+
+    targets: list[tuple[str, str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=min(16, args.workers)) as pool:
+        for rows in pool.map(_device_targets, devices):
+            targets.extend(rows)
+    log(f"firmware pairs inside Dopamine's supported versions: {len(targets)}")
+    if not targets:
+        die("no firmware pairs found; check network access to api.ipsw.me")
+    if args.limit:
+        targets = targets[:args.limit]
+
+    entries: dict[str, dict] = {}
+    skipped: list[tuple[str, str]] = []
+
+    def work(item: tuple[str, str, str, str]):
+        device, build, version, url = item
+        key = f"{device}|{build}"
+        try:
+            entry = _entry_for_fast([url], device, build, timeout=args.timeout)
+            entry["version"] = version
+            return key, entry, None
+        except Exception as exc:
+            return key, None, f"{type(exc).__name__}: {exc}"
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = [pool.submit(work, t) for t in targets]
+        for future in as_completed(futures):
+            key, entry, err = future.result()
+            done += 1
+            if entry:
+                entries[key] = entry
+            else:
+                skipped.append((key, err or "unknown"))
+            if done % 100 == 0 or done == len(targets):
+                log(f"progress {done}/{len(targets)} ok={len(entries)} "
+                    f"skipped={len(skipped)}")
+
+    if not entries:
+        die("no IPSW could be indexed; Apple CDN may be unreachable")
+    doc = {
+        "schema": 2,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "source": "ipsw.me device catalog + Apple CDN ZIP central directories",
+        "coverage": {
+            "devices": len(devices),
+            "firmwarePairs": len(targets),
+            "entries": len(entries),
+            "skipped": len(skipped),
+        },
+        "entries": entries,
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "wb") as f:
+        plistlib.dump(doc, f, fmt=plistlib.FMT_XML, sort_keys=True)
+    log(f"wrote {args.out} ({os.path.getsize(args.out)} bytes, "
+        f"{len(entries)} entries covering {len(devices)} device identifiers)")
+    for key, err in skipped[:15]:
+        log(f"  skipped {key}: {err[:150]}")
 
 
 def _load_targets(args) -> list[tuple[str, str, str | None]]:
@@ -694,6 +857,18 @@ def main() -> None:
     p.add_argument("--firmware-url")
     p.add_argument("--target-device")
 
+    p = sub.add_parser("fullindex")
+    p.add_argument("--out", required=True)
+    p.add_argument("--workers", type=int, default=32,
+                   help="concurrent IPSW central-directory probes")
+    p.add_argument("--timeout", type=int, default=25,
+                   help="per-request timeout for one IPSW probe")
+    p.add_argument("--limit", type=int, default=0,
+                   help="debug: only the first N firmware pairs")
+    p.add_argument("--device-limit", type=int, default=0,
+                   help="debug: only the first N device identifiers")
+    p.add_argument("--devices", help="optional file with device identifiers")
+
     p = sub.add_parser("patch")
     p.add_argument("--repo", required=True)
 
@@ -705,7 +880,8 @@ def main() -> None:
 
     args = ap.parse_args()
     {"selftest": cmd_selftest, "probe": cmd_probe, "index": cmd_index,
-     "fetch": cmd_fetch, "patch": cmd_patch, "pack": cmd_pack}[args.cmd](args)
+     "fullindex": cmd_fullindex, "fetch": cmd_fetch, "patch": cmd_patch,
+     "pack": cmd_pack}[args.cmd](args)
 
 
 if __name__ == "__main__":
