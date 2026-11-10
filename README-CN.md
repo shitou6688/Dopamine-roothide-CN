@@ -98,7 +98,9 @@ Relaxin 并不是"换了个国内下载源"。它把 kernelcache 里能静态确
 
 已验证：远程 ZIP64 目录解析（合成包自测）、Apple CDN 的 206 Range、真实 11.5 GB 与 7.9 GB 两份 IPSW 的 kernelcache / sptm / txm 定位与 SHA-256、补丁在真实 3.x 源码上的精确 diff 与幂等性、**GitHub Actions 全量编译 + 重打包 + 产物上传**（单设备版 run `42813628737`，15 步全绿，产出 4 个 IPA/TIPA 共 244 MB）、全量索引小样本（真实固件 4 条）、**CRC32 端到端**（真实 18,620,103 字节内核 inflate 后计算 `0x98e5063d`，与 ZIP 中央目录一致）。
 
-未执行：**真机越狱验证**（需要你自己的设备）。`coverage=all` 的全量构建由 CI 实测，跑完把结论补在这里。
+**全量构建已实测通过**：run `42818631584`，16 步全绿、21 分钟。生成 schema-2 索引 4,892,462 字节、**5,468 条** `<机型>|<Build>`，覆盖 **126 个设备标识**（设备目录共 181 个，其余没有支持范围内的固件），`skipped=0`；产物为 2 个 IPA/TIPA 共 111 MB，IPA 内已核对含该索引。
+
+未执行：**真机越狱验证**（需要你自己的设备）。
 
 工具链注意：runner 固定 `macos-15`、Xcode `16.4`。Xcode 26.6 / iPhoneOS26.5 SDK 下 Apple clang 21 的链接器会在 `watchdoghook.dylib` 段错误，`install_name_tool -delete_rpath` 也会报错；不要改成 `macos-latest`。另：`Install THEOS` 步骤不能提前创建非空的 `$THEOS`（安装脚本会误判为已安装并调用不存在的 `bin/update-theos`），SDK 用 `xz -dk` 显式解压。
 
