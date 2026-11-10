@@ -1,0 +1,239 @@
+name: Build Dopamine-roothide CN (no overseas network on device)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "index = 通用包(内置精简索引, Apple CDN 直连) | offline = 单机型完全离线包 | both = 两个都出"
+        required: true
+        default: both
+        type: choice
+        options: [both, index, offline]
+      device:
+        description: "机型标识，如 iPhone15,3 / iPad14,3。留空则读取 targets_file"
+        required: false
+        default: ""
+      os_build:
+        description: "系统 Build，如 21E236（设置-通用-关于本机）。与 device 必须同时填"
+        required: false
+        default: ""
+      firmware_url:
+        description: "可选：直接给出 IPSW 下载直链，跳过 ipsw.me 解析"
+        required: false
+        default: ""
+      targets_file:
+        description: "多行目标文件，格式 DEVICE|BUILD[|IPSW_URL]"
+        required: false
+        default: "Tools/targets.txt"
+      upstream_branch:
+        description: "上游分支（仅当本仓库不是 Dopamine fork 时用于克隆）"
+        required: false
+        default: "3.x"
+      make_release:
+        description: "是否同时发布到本仓库 Releases"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dopamine-cn-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Xcode setup
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          submodules: recursive
+          fetch-depth: 1
+
+      # Works in two layouts:
+      #   (a) this repo is a fork of Dopamine-roothide + Tools/ added  -> use it directly
+      #   (b) this repo only contains Tools/ + this workflow            -> clone upstream
+      - name: Locate source tree
+        run: |
+          set -e
+          if [ -f repo/Application/Dopamine.xcodeproj/project.pbxproj ]; then
+            echo "WORK_DIR=$GITHUB_WORKSPACE/repo" >> "$GITHUB_ENV"
+            echo "Source layout: Dopamine fork"
+          else
+            git clone --depth 1 --recurse-submodules --shallow-submodules \
+              -b "${{ inputs.upstream_branch }}" \
+              https://github.com/roothide/Dopamine-roothide.git upstream
+            cp -R repo/Tools upstream/Tools
+            echo "WORK_DIR=$GITHUB_WORKSPACE/upstream" >> "$GITHUB_ENV"
+            echo "Source layout: upstream clone + CN tools"
+          fi
+
+      - name: Install Procursus toolchain
+        uses: dhinakg/procursus-action@main
+        with:
+          packages: ldid findutils sed coreutils make
+
+      - name: Install build dependencies
+        run: |
+          set -e
+          brew install make libarchive
+          echo "PATH=$(brew --prefix make)/libexec/gnubin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install THEOS
+        run: |
+          set -ex
+          cd "$WORK_DIR"
+          export THEOS="$WORK_DIR/theos"
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos > install-theos.sh
+          gsed -E "/^\s*get_theos\s*$/,+1 s/^(\s*)(get_sdks)\s*$/\1mkdir -p \${THEOS}\/sdks\n\1touch \${THEOS}\/sdks\/sdk\n\1\2/g" -i install-theos.sh
+          bash install-theos.sh
+          curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz \
+            -o "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+          # macOS bsdtar (libarchive) reads .tar.xz directly. Upstream uses
+          # gunzip here, which is not guaranteed to handle xz on all runners.
+          tar -xf "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
+          rm "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+
+      - name: Build and install trustcache
+        run: |
+          set -ex
+          git clone --depth 1 https://github.com/CRKatri/trustcache.git trustcache-build
+          cd trustcache-build
+          export CFLAGS="$CFLAGS -I$(brew --prefix openssl)/include -arch arm64"
+          export LDFLAGS="$LDFLAGS -L$(brew --prefix openssl)/lib -arch arm64"
+          gmake -j"$(sysctl -n hw.logicalcpu)" OPENSSL=1
+          sudo cp trustcache /opt/procursus/bin/
+
+      - name: Prepare build targets
+        run: |
+          set -e
+          cd "$WORK_DIR"
+          mkdir -p build/cn
+          if [ -n "${{ inputs.device }}" ]; then
+            if [ -z "${{ inputs.os_build }}" ]; then
+              echo "::error::填写 device 时必须同时填写 os_build"
+              exit 1
+            fi
+            printf '%s|%s|%s\n' "${{ inputs.device }}" "${{ inputs.os_build }}" "${{ inputs.firmware_url }}" \
+              > build/cn/targets.all
+          else
+            cp "${{ inputs.targets_file }}" build/cn/targets.all
+          fi
+          grep -vE '^\s*(#|$)' build/cn/targets.all > build/cn/targets.active || true
+          if [ ! -s build/cn/targets.active ]; then
+            echo "::error::没有有效目标，请填写 device+os_build 或编辑 targets_file"
+            exit 1
+          fi
+          echo "--- targets ---"
+          cat build/cn/targets.active
+
+      - name: Apply CN kernel-source patch
+        run: |
+          set -ex
+          cd "$WORK_DIR"
+          python3 Tools/cn_kernel.py selftest
+          python3 Tools/cn_kernel.py patch --repo .
+
+      - name: Resolve kernel metadata (runs on the runner, not on the device)
+        if: inputs.mode != 'offline'
+        run: |
+          set -ex
+          cd "$WORK_DIR"
+          python3 Tools/cn_kernel.py index \
+            --out build/cn/KernelIndex.plist \
+            --targets build/cn/targets.active
+          ls -lh build/cn/KernelIndex.plist
+
+      - name: Download kernelcache for fully-offline IPA
+        if: inputs.mode != 'index'
+        run: |
+          set -ex
+          cd "$WORK_DIR"
+          : > build/cn/offline.manifest
+          n=0
+          while IFS= read -r line; do
+            n=$((n + 1))
+            printf '%s\n' "$line" > build/cn/one.target
+            dev=$(printf '%s' "$line" | cut -d'|' -f1)
+            bld=$(printf '%s' "$line" | cut -d'|' -f2)
+            python3 Tools/cn_kernel.py fetch \
+              --out "build/cn/offline/$n" \
+              --targets build/cn/one.target
+            printf '%s|%s|%s\n' "$dev" "$bld" "$n" >> build/cn/offline.manifest
+          done < build/cn/targets.active
+          find build/cn/offline -type f -exec ls -lh {} \;
+
+      - name: Build Dopamine-roothide
+        run: |
+          set -ex
+          cd "$WORK_DIR"
+          export THEOS="$WORK_DIR/theos"
+          gmake -j"$(sysctl -n hw.logicalcpu)" NIGHTLY=1
+          APP_VERSION="$(cat ./BaseBin/_external/basebin/.version)-$(cat ./BaseBin/_external/basebin/.version-roothide)"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          test -d ./Application/build/Build/Products/Debug-iphoneos/Dopamine.app
+
+      - name: Package CN IPA / TIPA
+        run: |
+          set -ex
+          cd "$WORK_DIR"
+          APP="$WORK_DIR/Application/build/Build/Products/Debug-iphoneos/Dopamine.app"
+          ENT="$WORK_DIR/Application/Dopamine/Dopamine.entitlements"
+          OUT="$WORK_DIR/build/cn/out"
+          mkdir -p "$OUT"
+          VER="CN-${{ env.APP_VERSION }}-$(git rev-parse --short HEAD)"
+
+          if [ "${{ inputs.mode }}" != "offline" ]; then
+            python3 Tools/cn_kernel.py pack \
+              --app "$APP" \
+              --resources build/cn/KernelIndex.plist \
+              --entitlements "$ENT" \
+              --out "$OUT/Dopamine-roothide-$VER.ipa"
+          fi
+
+          if [ "${{ inputs.mode }}" != "index" ]; then
+            # The universal bundle above left KernelIndex.plist inside the app;
+            # offline IPAs must carry only the three kernel payloads.
+            rm -f "$APP/KernelIndex.plist"
+            while IFS='|' read -r dev bld n; do
+              python3 Tools/cn_kernel.py pack \
+                --app "$APP" \
+                --resources "build/cn/offline/$n" \
+                --entitlements "$ENT" \
+                --out "$OUT/Dopamine-roothide-$VER-OFFLINE-${dev}-${bld}.ipa"
+              # Keep the universal bundle clean for the next iteration.
+              rm -f "$APP/kernelcache" "$APP/sptm.im4p" "$APP/txm.im4p"
+            done < build/cn/offline.manifest
+          fi
+          echo "--- artifacts ---"
+          ls -lh "$OUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dopamine-roothide-CN
+          path: ${{ env.WORK_DIR }}/build/cn/out/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: inputs.make_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cn-${{ env.APP_VERSION }}-${{ github.run_number }}
+          name: Dopamine-roothide CN ${{ env.APP_VERSION }} (build ${{ github.run_number }})
+          body: |
+            国内网络构建版。构建时已解析内核元数据，设备端不再访问 api.appledb.dev。
+            - `*.CN-*.ipa/.tipa`：通用包，内置 KernelIndex.plist，设备端只访问 Apple CDN（国内直连）。
+            - `*-OFFLINE-*.ipa/.tipa`：单机型完全离线包，内核文件已内置，越狱全程零联网下载。
+          files: ${{ env.WORK_DIR }}/build/cn/out/*

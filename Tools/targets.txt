@@ -1,0 +1,23 @@
+# Dopamine-roothide 国内内核源 —— 目标清单
+#
+# 每行一个目标，格式：  机型标识|系统Build[|IPSW直链(可选)]
+#   * 机型标识：设置 -> 通用 -> 关于本机 -> 型号名称对应的标识符，
+#              也可用 macOS/Windows 上的爱思助手、libimobiledevice (ideviceinfo -k ProductType) 查看。
+#   * 系统Build：设置 -> 通用 -> 关于本机 -> 版本下方的括号内编号，例如 21D61。
+#              设备端查表用的键就是 "<hw.machine>|<kern.osversion>"，必须准确。
+#   * IPSW直链：可选。留空时由构建机通过 AppleDB / ipsw.me 自动解析。
+#              解析不到时，把 https://updates.cdn-apple.com/... 开头的完整直链填在第三栏。
+#
+# 通用包(index/both) 会为下面每一行生成一个索引条目，可一次覆盖多台设备。
+# 完全离线包(offline/both) 会为每一行单独打一个 IPA，建议只写自己那一台。
+#
+# 示例（去掉行首 # 并改成你自己的机型与 build）：
+# iPhone15,3|21D61
+# iPhone13,2|20F75
+# iPad14,3|21E236
+#
+# 带直链的写法示例：
+# iPhone15,3|24B156|https://updates.cdn-apple.com/2026FallFCS/.../iPhone15,3_27.2.1_24B156_Restore.ipsw
+
+# >>> 在这里填写你自己的目标 <<<
+iPhone15,3|21D61
