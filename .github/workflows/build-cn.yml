@@ -93,16 +93,28 @@ jobs:
           set -ex
           cd "$WORK_DIR"
           export THEOS="$WORK_DIR/theos"
-          mkdir -p "$THEOS/sdks"
+          # Do NOT create $THEOS/sdks here: install-theos.sh treats a non-empty
+          # $THEOS as "already installed" and calls bin/update-theos, which does
+          # not exist on a fresh checkout. The gsed patch below creates the
+          # sdks/ placeholder after the clone instead.
           curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos > install-theos.sh
           gsed -E "/^\s*get_theos\s*$/,+1 s/^(\s*)(get_sdks)\s*$/\1mkdir -p \${THEOS}\/sdks\n\1touch \${THEOS}\/sdks\/sdk\n\1\2/g" -i install-theos.sh
           bash install-theos.sh
+          mkdir -p "$THEOS/sdks"
           curl -fL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz \
             -o "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
-          # macOS bsdtar (libarchive) reads .tar.xz directly. Upstream uses
-          # gunzip here, which is not guaranteed to handle xz on all runners.
-          tar -xf "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
-          rm "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+          # install-theos.sh installs xz-utils via Procursus. Decompress
+          # explicitly rather than relying on gunzip (which cannot read xz) or
+          # on the runner's bsdtar auto-detecting the lzma stream.
+          if command -v xz >/dev/null 2>&1; then
+            xz -dk "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+            tar -xf "$THEOS/sdks/iPhoneOS16.5.sdk.tar" -C "$THEOS/sdks"
+            rm -f "$THEOS/sdks/iPhoneOS16.5.sdk.tar"
+          else
+            tar -xf "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
+          fi
+          rm -f "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+          ls -la "$THEOS/sdks"
 
       - name: Build and install trustcache
         run: |
